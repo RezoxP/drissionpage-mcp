@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import importlib.metadata
 import json
 import os
@@ -9,6 +10,8 @@ import re
 import shutil
 import sys
 import time
+import urllib.parse
+import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +72,20 @@ def _truncate(value: str, max_chars: int) -> str:
 def _json(value: object, max_chars: int = 12000) -> str:
     text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
     return _truncate(text, max_chars)
+
+
+def _ok(**values: object) -> dict[str, object]:
+    return {"ok": True, **values}
+
+
+def _error(tool: str, exc: Exception, next_step: str) -> dict[str, object]:
+    return {
+        "ok": False,
+        "tool": tool,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "next": next_step,
+    }
 
 
 def _clean_selector_text(text: str) -> str:
@@ -203,6 +220,7 @@ class SnapshotRecord:
 class BrowserState:
     browser: object | None = None
     active_tab: object | None = None
+    known_tabs: dict[str, object] = field(default_factory=dict)
     refs: dict[str, dict[str, str]] = field(default_factory=dict)
     snapshots: dict[str, SnapshotRecord] = field(default_factory=dict)
     network_events: list[dict[str, object]] = field(default_factory=list)
@@ -215,9 +233,65 @@ class BrowserState:
 
     def tab(self) -> object:
         if self.active_tab is not None:
+            self.remember_tab(self.active_tab)
             return self.active_tab
         browser = self.require_browser()
         self.active_tab = browser.latest_tab
+        self.remember_tab(self.active_tab)
+        return self.active_tab
+
+    def remember_tab(self, tab: object | None) -> None:
+        if tab is None:
+            return
+        tab_id = str(getattr(tab, "tab_id", ""))
+        if tab_id:
+            self.known_tabs[tab_id] = tab
+
+    def get_tabs(self) -> list[object]:
+        browser = self.require_browser()
+        tabs: list[object] = []
+        if hasattr(browser, "get_tabs"):
+            try:
+                tabs = list(browser.get_tabs())
+            except Exception:
+                tabs = []
+        if not tabs:
+            tabs = list(self.known_tabs.values())
+        latest = getattr(browser, "latest_tab", None)
+        if latest is not None:
+            tabs.append(latest)
+        unique: dict[str, object] = {}
+        for tab in tabs:
+            tab_id = str(getattr(tab, "tab_id", ""))
+            if tab_id:
+                unique[tab_id] = tab
+        self.known_tabs.update(unique)
+        return list(unique.values())
+
+    def activate_tab(self, tab_id: str) -> object:
+        browser = self.require_browser()
+        for tab in self.get_tabs():
+            if str(getattr(tab, "tab_id", "")) == str(tab_id):
+                if hasattr(browser, "activate_tab"):
+                    browser.activate_tab(tab)
+                self.active_tab = tab
+                self.remember_tab(tab)
+                return tab
+        raise RuntimeError(f"Tab not found: {tab_id}. Call tab_list to see available tabs.")
+
+    def close_tab(self, tab_id: str = "") -> object | None:
+        browser = self.require_browser()
+        target = self.tab()
+        if tab_id:
+            target = self.activate_tab(tab_id)
+        target_id = str(getattr(target, "tab_id", ""))
+        if hasattr(browser, "close_tabs"):
+            browser.close_tabs(target)
+        else:
+            target.close()
+        self.known_tabs.pop(target_id, None)
+        tabs = self.get_tabs()
+        self.active_tab = tabs[-1] if tabs else None
         return self.active_tab
 
     def locate(self, target: str, by: str = "auto", timeout: float = 5.0) -> object:
@@ -385,13 +459,50 @@ def _store_snapshot(source: str, payload: object) -> dict[str, object]:
     return {"snapshot_id": snapshot_id, "chars": len(text)}
 
 
-def _current_tab_info() -> dict[str, object]:
-    tab = state.tab()
+def _tab_info(tab: object) -> dict[str, object]:
     return {
-        "url": tab.url,
-        "title": tab.title,
-        "tab_id": tab.tab_id,
+        "url": getattr(tab, "url", ""),
+        "title": getattr(tab, "title", ""),
+        "tab_id": getattr(tab, "tab_id", ""),
     }
+
+
+def _current_tab_info() -> dict[str, object]:
+    return _tab_info(state.tab())
+
+
+def _run_js_safely(tab: object, script: str, *args: object, as_expr: bool = False) -> object:
+    try:
+        if hasattr(tab, "run_js_loaded"):
+            return tab.run_js_loaded(script, *args, as_expr=as_expr)
+        return tab.run_js(script, *args, as_expr=as_expr)
+    except Exception as first_exc:
+        message = str(first_exc).lower()
+        if "runtime" in message or "context" in message or "faulty" in message:
+            try:
+                tab.wait(0.5)
+                return tab.run_js(script, *args, as_expr=as_expr)
+            except Exception:
+                pass
+        raise first_exc
+
+
+def _js_expression(expression: str) -> str:
+    stripped = expression.strip()
+    if stripped.startswith("return ") or "\n" in stripped or ";" in stripped:
+        return stripped
+    return f"return ({stripped});"
+
+
+def _element_xpath_fallback(tab: object, element: object, index: int) -> str:
+    element_id = getattr(element, "attr", lambda _: "")("id") if hasattr(element, "attr") else ""
+    if element_id:
+        return f"//*[@id={_xpath_literal(str(element_id))}]"
+    tag = getattr(element, "tag", "*") or "*"
+    text = _clean_selector_text(getattr(element, "text", "") or "")
+    if text:
+        return f"(//{tag}[contains(normalize-space(.), {_xpath_literal(text[:80])})])[{index}]"
+    return f"(//{tag})[{index}]"
 
 
 def create_app(log_level: str = "ERROR") -> FastMCP:
@@ -453,6 +564,8 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
         except TypeError:
             state.browser = Chromium(addr_or_opts=options)
         state.active_tab = state.browser.latest_tab
+        state.known_tabs.clear()
+        state.remember_tab(state.active_tab)
         return {
             "status": "connected",
             "address": state.browser._chromium_options.address,
@@ -468,6 +581,7 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
         browser.quit()
         state.browser = None
         state.active_tab = None
+        state.known_tabs.clear()
         state.refs.clear()
         return {"status": "closed"}
 
@@ -476,42 +590,35 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
         """Open a new browser tab."""
         browser = state.require_browser()
         tab = browser.new_tab(url)
+        state.remember_tab(tab)
         if activate:
             state.active_tab = tab
-        return {"status": "opened", "tab": _current_tab_info()}
+        return {"status": "opened", "tab": _tab_info(tab)}
 
     @app.tool()
     def tab_list() -> dict[str, object]:
         """List browser tabs."""
-        browser = state.require_browser()
-        tabs = []
-        for tab in browser.tabs:
-            tabs.append({"tab_id": tab.tab_id, "title": tab.title, "url": tab.url})
-        return {"active": _current_tab_info(), "tabs": tabs}
+        state.require_browser()
+        tabs = [_tab_info(tab) for tab in state.get_tabs()]
+        return {"active": _current_tab_info(), "tabs": tabs, "count": len(tabs)}
 
     @app.tool()
     def tab_activate(tab_id: str) -> dict[str, object]:
         """Activate a tab by DrissionPage tab id."""
-        browser = state.require_browser()
-        for tab in browser.tabs:
-            if str(tab.tab_id) == str(tab_id):
-                state.active_tab = tab
-                return {"status": "activated", "tab": _current_tab_info()}
-        raise RuntimeError(f"Tab not found: {tab_id}")
+        try:
+            tab = state.activate_tab(tab_id)
+            return {"status": "activated", "tab": _tab_info(tab)}
+        except Exception as exc:
+            return _error("tab_activate", exc, "Call tab_list, then pass one of the returned tab_id values.")
 
     @app.tool()
     def tab_close(tab_id: str = "") -> dict[str, object]:
         """Close a tab. Defaults to active tab."""
-        browser = state.require_browser()
-        target = state.tab()
-        if tab_id:
-            for tab in browser.tabs:
-                if str(tab.tab_id) == str(tab_id):
-                    target = tab
-                    break
-        target.close()
-        state.active_tab = browser.latest_tab if browser.tabs else None
-        return {"status": "closed", "active": _current_tab_info() if state.active_tab else None}
+        try:
+            active = state.close_tab(tab_id)
+            return {"status": "closed", "active": _tab_info(active) if active else None}
+        except Exception as exc:
+            return _error("tab_close", exc, "Call tab_list to refresh known tabs, then retry.")
 
     @app.tool()
     def page_navigate(url: str, wait_seconds: float = 0.5) -> dict[str, object]:
@@ -574,7 +681,35 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
     ) -> dict[str, object]:
         """Return a compact, AI-friendly snapshot and store the full payload for pagination."""
         tab = state.tab()
-        dom = tab.run_js(_snapshot_script(max_elements, text_limit, include_hidden, include_html))
+        try:
+            dom = _run_js_safely(
+                tab,
+                _snapshot_script(max_elements, text_limit, include_hidden, include_html),
+            )
+        except Exception as exc:
+            text = ""
+            with contextlib.suppress(Exception):
+                text = tab("t:body").text
+            payload = {
+                "dom": {
+                    "url": getattr(tab, "url", ""),
+                    "title": getattr(tab, "title", ""),
+                    "documentText": text,
+                    "elements": [],
+                },
+                "snapshot_error": str(exc),
+                "recovery": "JavaScript snapshot failed; returned body text fallback. Retry page_refresh then page_snapshot.",
+            }
+            stored = _store_snapshot("page_snapshot_fallback", payload)
+            return {
+                **stored,
+                "ok": False,
+                "active_tab": _current_tab_info(),
+                "ref_count": 0,
+                "content": _json(payload, max_chars=max_chars),
+                "truncated": False,
+                "next": "Call page_refresh, then page_snapshot. Use page_text if JS remains unavailable.",
+            }
         if not isinstance(dom, dict):
             dom = {"raw": dom}
 
@@ -646,12 +781,16 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
         found = []
         for index, element in enumerate(elements[:max_results], start=1):
             ref = f"f{index}"
-            xpath = element.run_js(
-                """
+            try:
+                xpath = _run_js_safely(
+                    element,
+                    """
 function xp(el){if(el.id)return `//*[@id="${el.id}"]`;const p=[];while(el&&el.nodeType===1){let i=1,s=el.previousElementSibling;while(s){if(s.nodeName===el.nodeName)i++;s=s.previousElementSibling;}p.unshift(`${el.nodeName.toLowerCase()}[${i}]`);el=el.parentElement;}return "/" + p.join("/");}
 return xp(this);
-"""
-            )
+""",
+                )
+            except Exception:
+                xpath = _element_xpath_fallback(tab, element, index)
             state.refs[ref] = {"css": "", "xpath": str(xpath)}
             found.append(
                 {
@@ -728,7 +867,7 @@ return {selected: true, value: option.value, text: option.text};
         target: str,
         offset_x: int,
         offset_y: int,
-        by: Literal["ref", "css", "xpath", "auto"] = "auto",
+        by: Literal["ref", "css", "xpath", "text", "role", "auto"] = "auto",
         timeout: float = 5.0,
     ) -> dict[str, object]:
         """Drag an element by pixel offset."""
@@ -760,10 +899,19 @@ return {selected: true, value: option.value, text: option.text};
         return {"status": "pressed", "key": key}
 
     @app.tool()
-    def js_eval(script: str, target: str = "", by: Literal["ref", "css", "xpath", "auto"] = "auto") -> dict[str, object]:
-        """Run JavaScript on the page or on a selected element. Use return to provide a result."""
-        result = state.locate(target, by).run_js(script) if target else state.tab().run_js(script)
-        return {"result": result}
+    def js_eval(script: str, target: str = "", by: Literal["ref", "css", "xpath", "text", "role", "auto"] = "auto") -> dict[str, object]:
+        """Run JavaScript on the page or on a selected element.
+
+        Simple expressions like `document.title` are wrapped with `return (...)` automatically.
+        Multi-line scripts or scripts starting with `return` are executed as-is.
+        """
+        try:
+            prepared = _js_expression(script)
+            runner = state.locate(target, by) if target else state.tab()
+            result = _run_js_safely(runner, prepared)
+            return _ok(result=result, returned_null=result is None)
+        except Exception as exc:
+            return _error("js_eval", exc, "Try page_refresh, then retry. For raw CDP, use cdp_send.")
 
     @app.tool()
     def cdp_send(command: str, params_json: str = "{}") -> dict[str, object]:
@@ -852,8 +1000,21 @@ return {selected: true, value: option.value, text: option.text};
         """Download a file through the active tab."""
         path = Path(save_path).expanduser()
         path.mkdir(parents=True, exist_ok=True)
-        result = state.tab().download(file_url=url, save_path=str(path), rename=rename or None)
-        return {"status": "downloaded", "result": str(result)}
+        safe_url = urllib.parse.quote(url, safe=":/?#[]@!$&'()*+,;=%")
+        try:
+            result = state.tab().download(file_url=safe_url, save_path=str(path), rename=rename or None)
+            return _ok(status="downloaded", result=str(result), url=safe_url)
+        except UnicodeEncodeError:
+            filename = rename or Path(urllib.parse.urlparse(url).path).name or "download"
+            target = path / filename
+            urllib.request.urlretrieve(safe_url, target)
+            return _ok(status="downloaded", result=str(target), url=safe_url, fallback="urllib")
+        except Exception as exc:
+            return _error(
+                "download_file",
+                exc,
+                "Check URL encoding and save_path. Unicode URLs are percent-encoded automatically.",
+            )
 
     @app.tool()
     def upload_file(file_path: str, target: str = "//input[@type='file']", by: Literal["xpath", "css", "ref", "auto"] = "xpath") -> dict[str, object]:
@@ -882,9 +1043,15 @@ return {selected: true, value: option.value, text: option.text};
         return {
             "browser_connected": state.browser is not None,
             "active_tab": _current_tab_info() if state.browser is not None else None,
+            "known_tabs": len(state.known_tabs),
             "refs": len(state.refs),
             "snapshots": len(state.snapshots),
             "network_events": len(state.network_events),
+            "ai_hints": [
+                "Use page_snapshot before element actions so refs are fresh.",
+                "If JavaScript tools report runtime faults, call page_refresh then retry.",
+                "Use snapshot_read when content is truncated instead of asking for another full snapshot.",
+            ],
         }
 
     return app
