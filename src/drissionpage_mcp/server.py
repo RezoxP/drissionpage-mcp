@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import importlib.metadata
 import json
 import os
 import re
@@ -52,6 +53,8 @@ DEFAULT_BROWSER_CANDIDATES = (
     "brave",
 )
 
+GIT_PACKAGE_URL = "git+https://github.com/RezoxP/drissionpage-mcp"
+
 
 def _now_id(prefix: str) -> str:
     return f"{prefix}_{int(time.time() * 1000)}"
@@ -84,10 +87,15 @@ def _xpath_literal(value: str) -> str:
 
 def _first_existing_path(paths: Sequence[str]) -> str:
     for raw_path in paths:
-        path = os.path.expandvars(os.path.expanduser(raw_path.strip()))
+        path = _normalize_browser_path(raw_path)
         if path and os.path.exists(path):
             return path
     return ""
+
+
+def _normalize_browser_path(path: str) -> str:
+    normalized = path.strip().strip('"').strip("'")
+    return os.path.expandvars(os.path.expanduser(normalized))
 
 
 def _find_browser_binary(explicit_path: str = "") -> str:
@@ -126,6 +134,62 @@ def _find_browser_binary(explicit_path: str = "") -> str:
             return resolved_command
 
     return ""
+
+
+def _package_version() -> str:
+    try:
+        return importlib.metadata.version("drissionpage-mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return "editable/local"
+
+
+def _mcp_config(command: str, args: Sequence[str]) -> dict[str, object]:
+    return {
+        "mcpServers": {
+            "drissionpage": {
+                "command": command,
+                "args": list(args),
+            }
+        }
+    }
+
+
+def _recommended_configs(browser_binary: str = "", install_from_git: bool = True) -> dict[str, object]:
+    binary_args = ["--browser-binary", browser_binary] if browser_binary else []
+    if install_from_git:
+        return _mcp_config("uvx", ["--from", GIT_PACKAGE_URL, "drissionpage-mcp", *binary_args])
+    return _mcp_config("drissionpage-mcp", binary_args)
+
+
+def _doctor_report(browser_binary: str = "", install_from_git: bool = True) -> dict[str, object]:
+    normalized_binary = _normalize_browser_path(browser_binary) if browser_binary else ""
+    binary_exists = bool(normalized_binary and os.path.exists(normalized_binary))
+    resolved_browser = ""
+    browser_error = ""
+    try:
+        resolved_browser = _find_browser_binary(normalized_binary)
+    except RuntimeError as exc:
+        browser_error = str(exc)
+
+    command = "uvx" if install_from_git else "drissionpage-mcp"
+    command_found = shutil.which(command) is not None
+    return {
+        "package_version": _package_version(),
+        "python": sys.version.split()[0],
+        "command": command,
+        "command_found": command_found,
+        "browser_binary_input": browser_binary,
+        "browser_binary_normalized": normalized_binary,
+        "browser_binary_exists": binary_exists,
+        "resolved_browser": resolved_browser,
+        "browser_error": browser_error,
+        "mcp_config": _recommended_configs(normalized_binary, install_from_git),
+        "tips": [
+            "Use the JSON config instead of typing the whole uv command as one MCP command.",
+            "On Windows, keep the browser path as one JSON string in args.",
+            "If using a local checkout, run uv sync first and set command to uv with args ['run', 'drissionpage-mcp', ...].",
+        ],
+    }
 
 
 @dataclass
@@ -349,6 +413,11 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
             "candidates": list(DEFAULT_BROWSER_CANDIDATES),
             "next": "Pass browser_binary to browser_start_or_connect if this is empty or wrong.",
         }
+
+    @app.tool()
+    def install_help(browser_binary: str = "", install_from_git: bool = True) -> dict[str, object]:
+        """Return ready-to-copy MCP configuration and installation diagnostics."""
+        return _doctor_report(browser_binary, install_from_git)
 
     @app.tool()
     def browser_start_or_connect(
@@ -824,6 +893,21 @@ return {selected: true, value: option.value, text: option.text};
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="DrissionPage MCP server")
     parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Print install diagnostics and a ready-to-copy MCP config, then exit.",
+    )
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        help="Print only a ready-to-copy MCP JSON config, then exit.",
+    )
+    parser.add_argument(
+        "--local-config",
+        action="store_true",
+        help="Generate config for an already installed drissionpage-mcp command instead of uvx.",
+    )
+    parser.add_argument(
         "--browser-binary",
         default="",
         help=(
@@ -839,7 +923,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
     if args.browser_binary:
-        os.environ["DRISSIONPAGE_MCP_BROWSER_BINARY"] = args.browser_binary
+        os.environ["DRISSIONPAGE_MCP_BROWSER_BINARY"] = _normalize_browser_path(args.browser_binary)
+
+    if args.doctor:
+        print(
+            json.dumps(
+                _doctor_report(args.browser_binary, install_from_git=not args.local_config),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.print_config:
+        print(
+            json.dumps(
+                _recommended_configs(
+                    _normalize_browser_path(args.browser_binary),
+                    install_from_git=not args.local_config,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
 
     try:
         create_app(log_level=args.log_level).run(transport="stdio")
