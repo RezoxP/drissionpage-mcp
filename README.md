@@ -24,7 +24,76 @@ This server combines the strongest ideas from the three reviewed implementations
 - Network response listener with filters and bounded logs.
 - Screenshots, cookies, file upload/download, browser/session diagnostics.
 
-## Install
+## Quick install
+
+The easiest setup is `uvx`, because MCP clients can install and run the server from GitHub
+without manually cloning this repository.
+
+```json
+{
+  "mcpServers": {
+    "drissionpage": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/RezoxP/drissionpage-mcp",
+        "drissionpage-mcp"
+      ]
+    }
+  }
+}
+```
+
+If Chrome is not installed or you want Thorium/Chromium/Edge/Brave instead, pass the browser
+binary as a separate argument:
+
+```json
+{
+  "mcpServers": {
+    "drissionpage": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/RezoxP/drissionpage-mcp",
+        "drissionpage-mcp",
+        "--browser-binary",
+        "C:\\Users\\Rohan\\AppData\\Local\\Thorium\\Application\\thorium.exe"
+      ]
+    }
+  }
+}
+```
+
+Do not put `uv run drissionpage-mcp --browser-binary ...` into the MCP `command` field as one
+string. MCP clients expect `command` and each argument to be split exactly like the JSON above.
+
+To generate config and check your browser path before adding it to an MCP client:
+
+```bash
+uvx --from git+https://github.com/RezoxP/drissionpage-mcp drissionpage-mcp --doctor --browser-binary "C:\Users\Rohan\AppData\Local\Thorium\Application\thorium.exe"
+```
+
+For a local checkout, use:
+
+```json
+{
+  "mcpServers": {
+    "drissionpage": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:\\path\\to\\drissionpage-mcp",
+        "run",
+        "drissionpage-mcp",
+        "--browser-binary",
+        "C:\\Users\\Rohan\\AppData\\Local\\Thorium\\Application\\thorium.exe"
+      ]
+    }
+  }
+}
+```
+
+## Package install
 
 ```bash
 pip install drissionpage-mcp
@@ -37,7 +106,7 @@ uv sync --extra dev
 uv run drissionpage-mcp
 ```
 
-## MCP configuration
+## MCP configuration after package install
 
 ```json
 {
@@ -65,6 +134,13 @@ If Chrome is not installed or you want to use another Chromium-compatible browse
 You can also set `DRISSIONPAGE_MCP_BROWSER_BINARY=/path/to/browser`. At runtime, call
 `browser_find_binary` to see what binary the server will use.
 
+Troubleshooting:
+
+- `transport closed` usually means the MCP command exited before the client initialized it.
+  Run `drissionpage-mcp --doctor` outside the MCP client first.
+- On Windows, browser paths with backslashes must be inside one JSON string.
+- Use `--print-config --browser-binary "..."` to print a ready-to-copy config.
+
 ## Recommended AI workflow
 
 1. `browser_start_or_connect`
@@ -78,6 +154,7 @@ You can also set `DRISSIONPAGE_MCP_BROWSER_BINARY=/path/to/browser`. At runtime,
 
 - Browser/tab: `browser_start_or_connect`, `browser_close`, `tab_new`, `tab_list`, `tab_activate`, `tab_close`
 - Browser discovery: `browser_find_binary`
+- Install/debug help: `install_help`
 - Navigation: `page_navigate`, `page_back`, `page_forward`, `page_refresh`, `page_info`, `wait`
 - Context: `page_snapshot`, `snapshot_read`, `page_text`, `element_find`
 - Interaction: `element_click`, `element_type`, `element_select`, `element_hover`, `element_drag`, `mouse_click_xy`, `keyboard_press`
