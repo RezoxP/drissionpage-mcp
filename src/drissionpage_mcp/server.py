@@ -102,6 +102,14 @@ def _xpath_literal(value: str) -> str:
     return f"concat({joined})"
 
 
+def _prefixed_locator(css: str = "", xpath: str = "") -> str:
+    if xpath:
+        return f"xpath:{xpath}"
+    if css:
+        return f"css:{css}"
+    return ""
+
+
 def _first_existing_path(paths: Sequence[str]) -> str:
     for raw_path in paths:
         path = _normalize_browser_path(raw_path)
@@ -221,7 +229,7 @@ class BrowserState:
     browser: object | None = None
     active_tab: object | None = None
     known_tabs: dict[str, object] = field(default_factory=dict)
-    refs: dict[str, dict[str, str]] = field(default_factory=dict)
+    refs: dict[str, dict[str, object]] = field(default_factory=dict)
     snapshots: dict[str, SnapshotRecord] = field(default_factory=dict)
     network_events: list[dict[str, object]] = field(default_factory=list)
     listening_tab: object | None = None
@@ -295,11 +303,36 @@ class BrowserState:
         return self.active_tab
 
     def locate(self, target: str, by: str = "auto", timeout: float = 5.0) -> object:
+        normalized = by.lower()
+        if normalized == "ref" or (normalized == "auto" and target in self.refs):
+            return self.locate_ref(target, timeout)
         tab = self.tab()
         locator = self.locator(target, by)
         element = tab.ele(locator, timeout=timeout)
         if not element:
             raise RuntimeError(f"Element not found: {locator}")
+        return element
+
+    def locate_ref(self, target: str, timeout: float = 5.0) -> object:
+        tab = self.tab()
+        ref = self.refs.get(target)
+        if ref is None:
+            raise RuntimeError(f"Unknown ref: {target}. Call page_snapshot or element_find again.")
+        locator = _prefixed_locator(str(ref.get("css", "")), str(ref.get("xpath", "")))
+        if not locator:
+            raise RuntimeError(f"Ref {target} has no usable selector.")
+
+        frame_locator = _prefixed_locator(
+            str(ref.get("frame_css", "")),
+            str(ref.get("frame_xpath", "")),
+        )
+        search_context = tab
+        if frame_locator:
+            search_context = _locate_frame(tab, frame_locator, timeout)
+
+        element = search_context.ele(locator, timeout=timeout)
+        if not element:
+            raise RuntimeError(f"Element not found for ref {target}: {locator}")
         return element
 
     def locator(self, target: str, by: str = "auto") -> str:
@@ -308,10 +341,10 @@ class BrowserState:
             ref = self.refs.get(target)
             if ref is None:
                 raise RuntimeError(f"Unknown ref: {target}. Call page_snapshot again.")
-            xpath = ref.get("xpath", "")
+            xpath = str(ref.get("xpath", ""))
             if xpath:
                 return f"xpath:{xpath}"
-            css = ref.get("css", "")
+            css = str(ref.get("css", ""))
             if css:
                 return f"css:{css}"
             raise RuntimeError(f"Ref {target} has no usable selector.")
@@ -350,10 +383,10 @@ function cleanText(value) {{
 }}
 
 function cssPath(el) {{
-  if (!(el instanceof Element)) return "";
+  if (!el || el.nodeType !== 1) return "";
   if (el.id) return "#" + CSS.escape(el.id);
   const parts = [];
-  while (el && el.nodeType === Node.ELEMENT_NODE && el !== document.body) {{
+  while (el && el.nodeType === 1 && el !== el.ownerDocument.body) {{
     let part = el.nodeName.toLowerCase();
     if (el.classList && el.classList.length) {{
       part += "." + Array.from(el.classList).slice(0, 3).map(CSS.escape).join(".");
@@ -370,10 +403,10 @@ function cssPath(el) {{
 }}
 
 function xpath(el) {{
-  if (!(el instanceof Element)) return "";
+  if (!el || el.nodeType !== 1) return "";
   if (el.id) return `//*[@id=${{JSON.stringify(el.id)}}]`;
   const parts = [];
-  while (el && el.nodeType === Node.ELEMENT_NODE) {{
+  while (el && el.nodeType === 1) {{
     let index = 1;
     let sibling = el.previousElementSibling;
     while (sibling) {{
@@ -387,7 +420,7 @@ function xpath(el) {{
 }}
 
 function visible(el) {{
-  if (!(el instanceof Element)) return false;
+  if (!el || el.nodeType !== 1) return false;
   const style = getComputedStyle(el);
   const rect = el.getBoundingClientRect();
   return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
@@ -400,23 +433,38 @@ function elementRole(el) {{
 
 function isInteractive(el) {{
   const tag = el.tagName.toLowerCase();
-  return ["a", "button", "input", "select", "textarea", "summary", "option"].includes(tag) ||
+  return ["a", "button", "input", "select", "textarea", "summary", "option", "iframe", "frame"].includes(tag) ||
     el.hasAttribute("onclick") || el.hasAttribute("contenteditable") || el.hasAttribute("role") ||
     el.tabIndex >= 0;
 }}
 
 const nodes = [];
-const all = Array.from(document.querySelectorAll("body *"));
+let scannedCount = 0;
+function collect(rootDocument, frameMeta = null) {{
+const all = Array.from(rootDocument.querySelectorAll("body *"));
+scannedCount += all.length;
 for (const el of all) {{
+  if (nodes.length >= maxElements) break;
   if (!includeHidden && !visible(el)) continue;
   const text = cleanText(el.innerText || el.textContent || "");
   const aria = el.getAttribute("aria-label") || "";
   const title = el.getAttribute("title") || "";
   const placeholder = el.getAttribute("placeholder") || "";
   const value = el.value || "";
-  const usefulText = cleanText([aria, title, placeholder, value, text].filter(Boolean).join(" | "));
+  let frameUrl = "";
+  let frameTitle = "";
+  const tag = el.tagName.toLowerCase();
+  if (tag === "iframe" || tag === "frame") {{
+    frameUrl = el.src || "";
+    try {{
+      frameTitle = el.contentDocument ? el.contentDocument.title : "";
+    }} catch (error) {{}}
+  }}
+  const usefulText = cleanText([aria, title, placeholder, value, frameTitle, frameUrl, text].filter(Boolean).join(" | "));
   if (!isInteractive(el) && !usefulText) continue;
   const rect = el.getBoundingClientRect();
+  const localCss = cssPath(el);
+  const localXpath = xpath(el);
   nodes.push({{
     ref: `e${{nodes.length + 1}}`,
     tag: el.tagName.toLowerCase(),
@@ -433,11 +481,25 @@ for (const el of all) {{
     y: Math.round(rect.y),
     width: Math.round(rect.width),
     height: Math.round(rect.height),
-    css: cssPath(el),
-    xpath: xpath(el),
+    css: localCss,
+    xpath: localXpath,
+    frameCss: frameMeta ? frameMeta.css : "",
+    frameXpath: frameMeta ? frameMeta.xpath : "",
+    frameUrl: frameMeta ? frameMeta.url : frameUrl,
     html: includeHtml ? el.outerHTML.slice(0, 1000) : undefined
   }});
+}}
+}}
+
+collect(document);
+const frames = Array.from(document.querySelectorAll("iframe, frame"));
+for (const frame of frames) {{
   if (nodes.length >= maxElements) break;
+  try {{
+    if (frame.contentDocument) {{
+      collect(frame.contentDocument, {{ css: cssPath(frame), xpath: xpath(frame), url: frame.src || "" }});
+    }}
+  }} catch (error) {{}}
 }}
 
 return {{
@@ -447,7 +509,7 @@ return {{
   documentText: cleanText(document.body ? document.body.innerText : "").slice(0, Math.max(textLimit * 10, 4000)),
   elements: nodes,
   elementCount: nodes.length,
-  truncated: all.length > nodes.length
+  truncated: scannedCount > nodes.length
 }};
 """
 
@@ -487,6 +549,49 @@ def _run_js_safely(tab: object, script: str, *args: object, as_expr: bool = Fals
         raise first_exc
 
 
+def _locate_frame(tab: object, frame_locator: str, timeout: float) -> object:
+    frame = tab.ele(frame_locator, timeout=timeout)
+    if not frame:
+        raise RuntimeError(f"Frame not found: {frame_locator}")
+    tag = str(getattr(frame, "tag", "")).lower()
+    if tag in {"iframe", "frame"} and hasattr(frame, "ele"):
+        return frame
+    if hasattr(frame, "frame_ele"):
+        frame_page = frame.frame_ele
+        if frame_page is not None:
+            return frame_page
+    if hasattr(tab, "get_frame"):
+        return tab.get_frame(frame_locator, timeout=timeout)
+    raise RuntimeError(f"Located frame is not searchable: {frame_locator}")
+
+
+def _candidate_locators(query: str, by: str) -> list[str]:
+    normalized = by.lower()
+    if normalized == "css":
+        return [f"css:{query}"]
+    if normalized == "xpath":
+        return [f"xpath:{query}"]
+    if normalized == "text":
+        return [f"xpath://*[contains(normalize-space(.), {_xpath_literal(query)})]"]
+    if normalized == "role":
+        return [f"xpath://*[@role={_xpath_literal(query)}]"]
+    if query.startswith(("css:", "xpath:")):
+        return [query]
+    if query.startswith(("/", "(")):
+        return [f"xpath:{query}"]
+
+    candidates = [f"css:{query}"]
+    if re.fullmatch(r"[\w -]{1,80}", query):
+        candidates.append(f"xpath://*[@role={_xpath_literal(query)}]")
+    candidates.append(f"xpath://*[contains(normalize-space(.), {_xpath_literal(query)})]")
+
+    deduped = []
+    for locator in candidates:
+        if locator not in deduped:
+            deduped.append(locator)
+    return deduped
+
+
 def _js_expression(expression: str) -> str:
     stripped = expression.strip()
     if stripped.startswith("return ") or "\n" in stripped or ";" in stripped:
@@ -499,10 +604,40 @@ def _element_xpath_fallback(tab: object, element: object, index: int) -> str:
     if element_id:
         return f"//*[@id={_xpath_literal(str(element_id))}]"
     tag = getattr(element, "tag", "*") or "*"
-    text = _clean_selector_text(getattr(element, "text", "") or "")
+    text = _element_text(element)
     if text:
         return f"(//{tag}[contains(normalize-space(.), {_xpath_literal(text[:80])})])[{index}]"
     return f"(//{tag})[{index}]"
+
+
+def _element_text(element: object, limit: int = 500) -> str:
+    if hasattr(element, "attr"):
+        values = []
+        for name in ("aria-label", "title", "placeholder", "value", "src", "href", "name", "id"):
+            with contextlib.suppress(Exception):
+                value = element.attr(name)
+                if value:
+                    values.append(str(value))
+        if values:
+            return _clean_selector_text(" | ".join(values))[:limit]
+    for attr_name in ("text", "inner_html", "html"):
+        value = getattr(element, attr_name, None)
+        if callable(value):
+            with contextlib.suppress(Exception):
+                value = value()
+        if value:
+            return _clean_selector_text(str(value))[:limit]
+    return ""
+
+
+def _css_selector_for_element(element: object) -> str:
+    element_id = ""
+    if hasattr(element, "attr"):
+        with contextlib.suppress(Exception):
+            element_id = str(element.attr("id") or "")
+    if element_id:
+        return "#" + re.sub(r"([ #.:,[\]>+~*'\"\\])", r"\\\1", element_id)
+    return ""
 
 
 def create_app(log_level: str = "ERROR") -> FastMCP:
@@ -713,7 +848,7 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
         if not isinstance(dom, dict):
             dom = {"raw": dom}
 
-        refs: dict[str, dict[str, str]] = {}
+        refs: dict[str, dict[str, object]] = {}
         elements = dom.get("elements", [])
         if isinstance(elements, list):
             for item in elements:
@@ -722,7 +857,12 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
                     css = str(item.get("css", ""))
                     xpath = str(item.get("xpath", ""))
                     if ref:
-                        refs[ref] = {"css": css, "xpath": xpath}
+                        refs[ref] = {
+                            "css": css,
+                            "xpath": xpath,
+                            "frame_css": str(item.get("frameCss", "")),
+                            "frame_xpath": str(item.get("frameXpath", "")),
+                        }
         state.refs = refs
 
         payload: dict[str, object] = {"dom": dom}
@@ -765,7 +905,7 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
     def page_text(selector: str = "body", by: Literal["css", "xpath", "auto"] = "css") -> dict[str, object]:
         """Get readable text from a page region."""
         element = state.locate(selector, by)
-        return {"selector": selector, "text": element.text}
+        return {"selector": selector, "text": _element_text(element, limit=20000)}
 
     @app.tool()
     def element_find(
@@ -773,34 +913,77 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
         by: Literal["css", "xpath", "text", "role", "auto"] = "auto",
         timeout: float = 3.0,
         max_results: int = 20,
+        include_frames: bool = True,
     ) -> dict[str, object]:
-        """Find elements and return text, selector hints, and generated refs."""
+        """Find elements quickly across the page and same-origin frames, then return generated refs."""
         tab = state.tab()
-        locator = state.locator(query, by)
-        elements = tab.eles(locator, timeout=timeout)
+        locators = _candidate_locators(query, by)
+        search_contexts: list[tuple[object, str, str, str]] = [(tab, "", "", "main")]
+        if include_frames:
+            with contextlib.suppress(Exception):
+                frames = tab.eles("xpath://iframe|//frame", timeout=min(timeout, 0.5))
+                for frame_index, frame in enumerate(frames[: max(max_results, 1)], start=1):
+                    frame_xpath = _element_xpath_fallback(tab, frame, frame_index)
+                    frame_css = _css_selector_for_element(frame)
+                    search_contexts.append((frame, frame_css, frame_xpath, f"frame:{frame_index}"))
+
         found = []
-        for index, element in enumerate(elements[:max_results], start=1):
-            ref = f"f{index}"
-            try:
-                xpath = _run_js_safely(
-                    element,
-                    """
+        total_count = 0
+        matched_locator = ""
+        for search_context, frame_css, frame_xpath, frame_label in search_contexts:
+            if len(found) >= max_results:
+                break
+            elements = []
+            for locator in locators:
+                try:
+                    elements = search_context.eles(locator, timeout=timeout if not found else 0.2)
+                except Exception:
+                    continue
+                if elements:
+                    matched_locator = locator
+                    break
+            total_count += len(elements)
+            for element in elements:
+                if len(found) >= max_results:
+                    break
+                index = len(found) + 1
+                ref = f"f{index}"
+                xpath = ""
+                with contextlib.suppress(Exception):
+                    xpath = str(
+                        _run_js_safely(
+                            element,
+                            """
 function xp(el){if(el.id)return `//*[@id="${el.id}"]`;const p=[];while(el&&el.nodeType===1){let i=1,s=el.previousElementSibling;while(s){if(s.nodeName===el.nodeName)i++;s=s.previousElementSibling;}p.unshift(`${el.nodeName.toLowerCase()}[${i}]`);el=el.parentElement;}return "/" + p.join("/");}
 return xp(this);
 """,
-                )
-            except Exception:
-                xpath = _element_xpath_fallback(tab, element, index)
-            state.refs[ref] = {"css": "", "xpath": str(xpath)}
-            found.append(
-                {
-                    "ref": ref,
-                    "tag": element.tag,
-                    "text": _clean_selector_text(element.text)[:500],
-                    "xpath": xpath,
+                        )
+                    )
+                if not xpath:
+                    xpath = _element_xpath_fallback(search_context, element, index)
+                state.refs[ref] = {
+                    "css": "",
+                    "xpath": str(xpath),
+                    "frame_css": frame_css,
+                    "frame_xpath": frame_xpath,
                 }
-            )
-        return {"query": query, "locator": locator, "count": len(elements), "results": found}
+                found.append(
+                    {
+                        "ref": ref,
+                        "tag": getattr(element, "tag", ""),
+                        "text": _element_text(element),
+                        "xpath": xpath,
+                        "frame": frame_label,
+                    }
+                )
+        return {
+            "query": query,
+            "locator": matched_locator or locators[0],
+            "tried_locators": locators[:3],
+            "count": total_count,
+            "returned": len(found),
+            "results": found,
+        }
 
     @app.tool()
     def element_click(
