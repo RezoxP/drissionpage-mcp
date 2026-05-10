@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
 import re
+import shutil
+import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -37,6 +41,17 @@ SAFE_KEY_NAMES = {
     "delete": "DELETE",
 }
 
+DEFAULT_BROWSER_CANDIDATES = (
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+    "microsoft-edge",
+    "msedge",
+    "brave-browser",
+    "brave",
+)
+
 
 def _now_id(prefix: str) -> str:
     return f"{prefix}_{int(time.time() * 1000)}"
@@ -65,6 +80,52 @@ def _xpath_literal(value: str) -> str:
     parts = value.split("'")
     joined = ", \"'\", ".join(f"'{part}'" for part in parts)
     return f"concat({joined})"
+
+
+def _first_existing_path(paths: Sequence[str]) -> str:
+    for raw_path in paths:
+        path = os.path.expandvars(os.path.expanduser(raw_path.strip()))
+        if path and os.path.exists(path):
+            return path
+    return ""
+
+
+def _find_browser_binary(explicit_path: str = "") -> str:
+    if explicit_path:
+        resolved = _first_existing_path([explicit_path])
+        if not resolved:
+            raise RuntimeError(f"Browser binary does not exist: {explicit_path}")
+        return resolved
+
+    env_path = os.getenv("DRISSIONPAGE_MCP_BROWSER_BINARY") or os.getenv("CHROME_PATH")
+    if env_path:
+        resolved = _first_existing_path([env_path])
+        if not resolved:
+            raise RuntimeError(f"Configured browser binary does not exist: {env_path}")
+        return resolved
+
+    common_paths = (
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    )
+    resolved = _first_existing_path(common_paths)
+    if resolved:
+        return resolved
+
+    for candidate in DEFAULT_BROWSER_CANDIDATES:
+        resolved_command = shutil.which(candidate)
+        if resolved_command:
+            return resolved_command
+
+    return ""
 
 
 @dataclass
@@ -269,24 +330,48 @@ def _current_tab_info() -> dict[str, object]:
     }
 
 
-def create_app() -> FastMCP:
-    app = FastMCP("drissionpage-mcp", instructions=INSTRUCTIONS)
+def create_app(log_level: str = "ERROR") -> FastMCP:
+    app = FastMCP("drissionpage-mcp", instructions=INSTRUCTIONS, log_level=log_level)
+
+    @app.tool()
+    def browser_find_binary(browser_binary: str = "") -> dict[str, object]:
+        """Resolve the browser executable that will be used for new browser sessions."""
+        resolved = _find_browser_binary(browser_binary)
+        return {
+            "browser_binary": resolved,
+            "found": bool(resolved),
+            "env": {
+                "DRISSIONPAGE_MCP_BROWSER_BINARY": bool(
+                    os.getenv("DRISSIONPAGE_MCP_BROWSER_BINARY")
+                ),
+                "CHROME_PATH": bool(os.getenv("CHROME_PATH")),
+            },
+            "candidates": list(DEFAULT_BROWSER_CANDIDATES),
+            "next": "Pass browser_binary to browser_start_or_connect if this is empty or wrong.",
+        }
 
     @app.tool()
     def browser_start_or_connect(
         port: int = 9222,
         headless: bool = False,
+        browser_binary: str = "",
         browser_path: str = "",
         user_data_dir: str = "",
         arguments: list[str] | None = None,
     ) -> dict[str, object]:
-        """Start or attach to Chromium through DrissionPage."""
+        """Start or attach to Chromium through DrissionPage.
+
+        browser_binary can point to Chrome, Chromium, Edge, Brave, or another Chromium-compatible
+        executable when Chrome is not installed. The legacy browser_path name is still accepted.
+        """
         from DrissionPage import Chromium, ChromiumOptions
 
         options = ChromiumOptions()
         options.set_local_port(port)
-        if browser_path:
-            options.set_browser_path(browser_path)
+        requested_binary = browser_binary or browser_path
+        resolved_binary = _find_browser_binary(requested_binary)
+        if resolved_binary:
+            options.set_browser_path(resolved_binary)
         if user_data_dir:
             options.set_user_data_path(user_data_dir)
         if headless:
@@ -302,6 +387,7 @@ def create_app() -> FastMCP:
         return {
             "status": "connected",
             "address": state.browser._chromium_options.address,
+            "browser_binary": resolved_binary or "DrissionPage default",
             "active_tab": _current_tab_info(),
             "next": "Call page_navigate or page_snapshot.",
         }
@@ -735,8 +821,33 @@ return {selected: true, value: option.value, text: option.text};
     return app
 
 
-def main() -> None:
-    create_app().run(transport="stdio")
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="DrissionPage MCP server")
+    parser.add_argument(
+        "--browser-binary",
+        default="",
+        help=(
+            "Path to a Chromium-compatible browser binary. Also configurable with "
+            "DRISSIONPAGE_MCP_BROWSER_BINARY."
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("DRISSIONPAGE_MCP_LOG_LEVEL", "ERROR"),
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        help="Logging level for the MCP server.",
+    )
+    args = parser.parse_args(argv)
+    if args.browser_binary:
+        os.environ["DRISSIONPAGE_MCP_BROWSER_BINARY"] = args.browser_binary
+
+    try:
+        create_app(log_level=args.log_level).run(transport="stdio")
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        print(f"drissionpage-mcp startup failed: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":
