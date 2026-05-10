@@ -2,14 +2,6 @@
 
 Powerful browser automation for MCP clients, built on [DrissionPage](https://github.com/g1879/DrissionPage).
 
-This server combines the strongest ideas from the three reviewed implementations while keeping responses context-friendly for AI agents:
-
-| Implementation | Pros kept | Cons avoided |
-| --- | --- | --- |
-| `persist-1/DrissionPage-MCP-Server` | Broad tool coverage, modular browser/DOM/network concepts, screenshots, cookies, CDP, file helpers | Overly large dependency set, verbose responses, Windows-biased browser path handling |
-| `jumodada/Drissionpage-MCP-Server` | Clean MCP shape, typed tool schemas, deterministic selector operations, simple install/run flow | Small tool surface and limited page/context capture |
-| `wxhzhwxhzh/DrissionPageMCP` | Full DrissionPage power: CDP, keyboard, upload/download, hover/drag, response listeners, accessibility tree | Single-file structure, inconsistent names, typo-prone APIs, unbounded output |
-
 ## Highlights
 
 - Browser lifecycle, tab switching, navigation, history, refresh, close.
