@@ -136,9 +136,9 @@ Troubleshooting:
 ## Recommended AI workflow
 
 1. `browser_start_or_connect`
-2. `page_navigate`
-3. `page_snapshot`
-4. Act with refs from the snapshot, for example `element_click(target="e3", by="ref")`
+2. `page_navigate(snapshot=true)` to wait for load/network idle and return refs immediately
+3. `page_snapshot` or `snapshot_region(landmark="main")` to refine context
+4. Act with refs from the snapshot, for example `element_actions(actions=[{"action":"type","target":"e3","text":"John"},{"action":"click","target":"e8"}])`
 5. Use `snapshot_read` if the page is larger than the context window
 6. Use `js_eval` or `cdp_send` only when normal tools are insufficient
 
@@ -148,7 +148,7 @@ Troubleshooting:
 - Browser discovery: `browser_find_binary`
 - Install/debug help: `install_help`
 - Navigation: `page_navigate`, `page_back`, `page_forward`, `page_refresh`, `page_info`, `wait`
-- Context: `page_snapshot`, `snapshot_read`, `page_text`, `element_find`
-- Interaction: `element_click`, `element_type`, `element_select`, `element_hover`, `element_drag`, `mouse_click_xy`, `keyboard_press`
+- Context: `page_snapshot`, `snapshot_read`, `snapshot_region`, `page_text`, `element_find`
+- Interaction: `element_actions`, `mouse_click_xy`, `keyboard_press`, `alert_dismiss`
 - Power tools: `js_eval`, `cdp_send`, `network_start`, `network_stop`, `network_logs`
 - Files/session: `page_screenshot`, `download_file`, `upload_file`, `cookies_get`, `session_info`
