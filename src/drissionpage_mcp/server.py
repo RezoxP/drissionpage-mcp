@@ -420,19 +420,24 @@ function cssPath(el) {{
   if (el.id) return "#" + CSS.escape(el.id);
   const parts = [];
   while (el && el.nodeType === 1 && el !== el.ownerDocument.body) {{
+    if (el.id) {{
+      parts.unshift("#" + CSS.escape(el.id));
+      break;
+    }}
     let part = el.nodeName.toLowerCase();
     if (el.classList && el.classList.length) {{
       part += "." + Array.from(el.classList).slice(0, 3).map(CSS.escape).join(".");
     }}
     const parent = el.parentElement;
-    if (parent) {{
+    if (parent && !el.id) {{
       const siblings = Array.from(parent.children).filter((child) => child.nodeName === el.nodeName);
       if (siblings.length > 1) part += `:nth-of-type(${{siblings.indexOf(el) + 1}})`;
     }}
     parts.unshift(part);
     el = parent;
+    if (parts.length >= 3) break;
   }}
-  return parts.length ? "body > " + parts.join(" > ") : "body";
+  return parts.join(" > ");
 }}
 
 function xpath(el) {{
@@ -440,6 +445,10 @@ function xpath(el) {{
   if (el.id) return `//*[@id=${{JSON.stringify(el.id)}}]`;
   const parts = [];
   while (el && el.nodeType === 1) {{
+    if (el.id) {{
+      parts.unshift(`*[@id=${{JSON.stringify(el.id)}}]`);
+      return "//" + parts.join("/");
+    }}
     let index = 1;
     let sibling = el.previousElementSibling;
     while (sibling) {{
@@ -737,7 +746,24 @@ def _snapshot_payload(
         dom = {"raw": dom}
     state.refs = _apply_stable_refs(dom)
 
+    # Deduplicate landmarks
+    landmarks: dict[str, list[str]] = {}
+    if "nodes" in dom and isinstance(dom["nodes"], list):
+        for node in dom["nodes"]:
+            if "landmark" in node and isinstance(node["landmark"], dict):
+                landmark = node.pop("landmark")
+                role = landmark.get("role", "document")
+                label = landmark.get("label", "document")
+                # Group by role and label
+                key = f"{role} - {label}" if label and label != role else role
+                if key not in landmarks:
+                    landmarks[key] = []
+                landmarks[key].append(node.get("ref"))
+
     payload: dict[str, object] = {"dom": dom}
+    if landmarks:
+        payload["landmarks"] = landmarks
+
     if include_accessibility:
         try:
             tab.run_cdp("Accessibility.enable")
@@ -752,7 +778,9 @@ def _state_change_payload(
 ) -> dict[str, object]:
     tab = state.tab()
     after = _current_tab_info()
-    changed = before.get("url") != after.get("url") or before.get("title") != after.get("title")
+    changed: bool = before.get("url") != after.get("url") or before.get("title") != after.get(
+        "title"
+    )
     elements_changed: list[dict[str, object]] = []
     with contextlib.suppress(Exception):
         payload = _snapshot_payload(
@@ -817,14 +845,21 @@ def _locate_frame(tab: object, frame_locator: str, timeout: float) -> object:
     raise RuntimeError(f"Located frame is not searchable: {frame_locator}")
 
 
-def _candidate_locators(query: str, by: str) -> list[str]:
+def _candidate_locators(query: str, by: str, leaf_only: bool = False) -> list[str]:
     normalized = by.lower()
+
+    def text_xpath(q: str) -> str:
+        base = f"//*[contains(normalize-space(.), {_xpath_literal(q)})]"
+        if leaf_only:
+            return f"xpath:{base}[not(.//*[contains(normalize-space(.), {_xpath_literal(q)})])]"
+        return f"xpath:{base}"
+
     if normalized == "css":
         return [f"css:{query}"]
     if normalized == "xpath":
         return [f"xpath:{query}"]
     if normalized == "text":
-        return [f"xpath://*[contains(normalize-space(.), {_xpath_literal(query)})]"]
+        return [text_xpath(query)]
     if normalized == "role":
         return [f"xpath://*[@role={_xpath_literal(query)}]"]
     if query.startswith(("css:", "xpath:")):
@@ -835,7 +870,7 @@ def _candidate_locators(query: str, by: str) -> list[str]:
     candidates = [f"css:{query}"]
     if re.fullmatch(r"[\w -]{1,80}", query):
         candidates.append(f"xpath://*[@role={_xpath_literal(query)}]")
-    candidates.append(f"xpath://*[contains(normalize-space(.), {_xpath_literal(query)})]")
+    candidates.append(text_xpath(query))
 
     deduped = []
     for locator in candidates:
@@ -1272,72 +1307,92 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
         return {"status": "closed"}
 
     @tool()
-    def tab_new(url: str = "about:blank", activate: bool = True) -> dict[str, object]:
-        """Open a new browser tab."""
-        browser = state.require_browser()
-        tab = browser.new_tab(url)
-        state.remember_tab(tab)
-        _install_dialog_listener(tab)
-        if activate:
+    def tab_manage(
+        action: Literal["list", "new", "activate", "close"] = "list",
+        url: str = "about:blank",
+        tab_id: str = "",
+    ) -> dict[str, object]:
+        """Manage browser tabs. Combine listing, creating, activating, and closing tabs."""
+        if action == "list":
+            state.require_browser()
+            tabs = [_tab_info(tab) for tab in state.get_tabs()]
+            return {"active": _current_tab_info(), "tabs": tabs, "count": len(tabs)}
+        elif action == "new":
+            browser = state.require_browser()
+            tab = browser.new_tab(url)
+            state.remember_tab(tab)
+            _install_dialog_listener(tab)
             state.active_tab = tab
-        return {"status": "opened", "tab": _tab_info(tab)}
-
-    @tool()
-    def tab_list() -> dict[str, object]:
-        """List browser tabs."""
-        state.require_browser()
-        tabs = [_tab_info(tab) for tab in state.get_tabs()]
-        return {"active": _current_tab_info(), "tabs": tabs, "count": len(tabs)}
-
-    @tool()
-    def tab_activate(tab_id: str) -> dict[str, object]:
-        """Activate a tab by DrissionPage tab id."""
-        try:
-            tab = state.activate_tab(tab_id)
-            return {"status": "activated", "tab": _tab_info(tab)}
-        except Exception as exc:
-            return _error(
-                "tab_activate", exc, "Call tab_list, then pass one of the returned tab_id values."
-            )
-
-    @tool()
-    def tab_close(tab_id: str = "") -> dict[str, object]:
-        """Close a tab. Defaults to active tab."""
-        try:
-            active = state.close_tab(tab_id)
-            return {"status": "closed", "active": _tab_info(active) if active else None}
-        except Exception as exc:
-            return _error("tab_close", exc, "Call tab_list to refresh known tabs, then retry.")
+            return {"status": "opened", "tab": _tab_info(tab)}
+        elif action == "activate":
+            try:
+                tab = state.activate_tab(tab_id)
+                return {"status": "activated", "tab": _tab_info(tab)}
+            except Exception as exc:
+                return _error("tab_activate", exc, "Call tab_manage(action='list').")
+        elif action == "close":
+            try:
+                active = state.close_tab(tab_id)
+                return {"status": "closed", "active": _tab_info(active) if active else None}
+            except Exception as exc:
+                return _error("tab_close", exc, "Call tab_manage(action='list').")
+        return {"error": f"Unknown action: {action}"}
 
     @tool()
     def page_navigate(
-        url: str,
+        action: Literal["go", "back", "forward", "refresh"] = "go",
+        url: str = "",
         snapshot: bool = False,
         timeout: float = 15.0,
         network_idle_ms: int = 500,
         wait_seconds: float = 0.0,
     ) -> dict[str, object]:
-        """Navigate the active tab and wait for load + network idle; optionally return refs."""
+        """Navigate the active tab (go to URL, back, forward, refresh) and optionally return a snapshot."""
         if not state.browser:
             browser_start_or_connect()
         tab = state.tab()
         before = _current_tab_info()
         _install_dialog_listener(tab)
-        tab.get(url)
+
+        if action == "go":
+            if not url:
+                return {"error": "URL is required when action='go'"}
+            tab.get(url)
+        elif action == "back":
+            tab.back()
+        elif action == "forward":
+            tab.forward()
+        elif action == "refresh":
+            tab.refresh()
+
         ready = _wait_for_page_ready(tab, timeout=timeout, network_idle_ms=network_idle_ms)
         if wait_seconds > 0:
             tab.wait(wait_seconds)
+
+        after = _current_tab_info()
+        page_changed = before.get("url") != after.get("url") or before.get("title") != after.get(
+            "title"
+        )
+
         result: dict[str, object] = {
-            "status": "navigated",
-            "tab": _current_tab_info(),
+            "status": "navigated" if action == "go" else action,
+            "tab": after,
             "ready": ready,
-            **_state_change_payload(before),
+            "page_changed": page_changed,
             "next": "Call page_snapshot."
             if not snapshot
             else "Use returned refs with element_actions.",
         }
         if snapshot:
             payload = _snapshot_payload(tab, include_accessibility=False)
+
+            # Since we have the DOM, we can compute element changes
+            dom = payload.get("dom", {})
+            if isinstance(dom, dict):
+                elements_changed = _changed_elements(dom)[:30]
+                result["changed_elements"] = elements_changed
+                result["page_changed"] = page_changed or bool(elements_changed)
+
             stored = _store_snapshot("page_navigate_snapshot", payload)
             compact = _json(payload, max_chars=12000)
             result.update(
@@ -1349,33 +1404,6 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
                 }
             )
         return result
-
-    @tool()
-    def page_back(wait_seconds: float = 0.5) -> dict[str, object]:
-        """Go back in browser history."""
-        tab = state.tab()
-        tab.back()
-        if wait_seconds > 0:
-            tab.wait(wait_seconds)
-        return {"status": "ok", "tab": _current_tab_info()}
-
-    @tool()
-    def page_forward(wait_seconds: float = 0.5) -> dict[str, object]:
-        """Go forward in browser history."""
-        tab = state.tab()
-        tab.forward()
-        if wait_seconds > 0:
-            tab.wait(wait_seconds)
-        return {"status": "ok", "tab": _current_tab_info()}
-
-    @tool()
-    def page_refresh(wait_seconds: float = 0.5) -> dict[str, object]:
-        """Refresh the active tab."""
-        tab = state.tab()
-        tab.refresh()
-        if wait_seconds > 0:
-            tab.wait(wait_seconds)
-        return {"status": "ok", "tab": _current_tab_info()}
 
     @tool()
     def page_info() -> dict[str, object]:
@@ -1510,13 +1538,14 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
     def element_find(
         query: str,
         by: Literal["css", "xpath", "text", "role", "auto"] = "auto",
+        leaf_only: bool = False,
         timeout: float = 3.0,
         max_results: int = 20,
         include_frames: bool = True,
     ) -> dict[str, object]:
         """Find elements quickly across the page and same-origin frames, then return generated refs."""
         tab = state.tab()
-        locators = _candidate_locators(query, by)
+        locators = _candidate_locators(query, by, leaf_only=leaf_only)
         search_contexts: list[tuple[object, str, str, str]] = [(tab, "", "", "main")]
         if include_frames:
             with contextlib.suppress(Exception):
@@ -1526,7 +1555,7 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
                     frame_css = _css_selector_for_element(frame)
                     search_contexts.append((frame, frame_css, frame_xpath, f"frame:{frame_index}"))
 
-        candidates = []
+        candidates: list[tuple[object, object, str, str, str]] = []
         total_count = 0
         matched_locator = ""
         for search_context, frame_css, frame_xpath, frame_label in search_contexts:
@@ -1545,7 +1574,7 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
             for element in elements:
                 candidates.append((element, search_context, frame_css, frame_xpath, frame_label))
         candidates.sort(key=lambda row: _rank_element(row[0], query))
-        found = []
+        found: list[dict[str, object]] = []
         for element, search_context, frame_css, frame_xpath, frame_label in candidates[
             :max_results
         ]:
@@ -1557,7 +1586,7 @@ def create_app(log_level: str = "ERROR") -> FastMCP:
                     _run_js_safely(
                         element,
                         """
-function xp(el){if(el.id)return `//*[@id="${el.id}"]`;const p=[];while(el&&el.nodeType===1){let i=1,s=el.previousElementSibling;while(s){if(s.nodeName===el.nodeName)i++;s=s.previousElementSibling;}p.unshift(`${el.nodeName.toLowerCase()}[${i}]`);el=el.parentElement;}return "/" + p.join("/");}
+function xp(el){if(el.id)return `//*[@id="${el.id}"]`;const p=[];while(el&&el.nodeType===1){if(el.id){p.unshift(`*[@id="${el.id}"]`);return "//"+p.join("/");}let i=1,s=el.previousElementSibling;while(s){if(s.nodeName===el.nodeName)i++;s=s.previousElementSibling;}p.unshift(`${el.nodeName.toLowerCase()}[${i}]`);el=el.parentElement;}return "/"+p.join("/");}
 return xp(this);
 """,
                     )
