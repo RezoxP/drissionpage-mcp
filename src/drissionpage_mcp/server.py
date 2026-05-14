@@ -2,7 +2,6 @@ import argparse
 import contextlib
 import difflib
 import functools
-import importlib.metadata
 import inspect
 import json
 import os
@@ -14,6 +13,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from importlib import metadata
 from pathlib import Path
 from typing import Literal
 
@@ -185,8 +185,8 @@ def _find_browser_binary(explicit_path: str = "") -> str:
 
 def _package_version() -> str:
     try:
-        return importlib.metadata.version("drissionpage-mcp")
-    except importlib.metadata.PackageNotFoundError:
+        return metadata.version("drissionpage-mcp")
+    except metadata.PackageNotFoundError:
         return "editable/local"
 
 
