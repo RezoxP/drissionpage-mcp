@@ -10,7 +10,6 @@ import shutil
 import sys
 import time
 import urllib.parse
-import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
@@ -1666,9 +1665,10 @@ return xp(this);
             )
             return _ok(status="downloaded", result=str(result), url=safe_url)
         except UnicodeEncodeError:
+            from urllib.request import urlretrieve
             filename = rename or Path(urllib.parse.urlparse(url).path).name or "download"
             target = path / filename
-            urllib.request.urlretrieve(safe_url, target)
+            urlretrieve(safe_url, target)
             return _ok(status="downloaded", result=str(target), url=safe_url, fallback="urllib")
         except Exception as exc:
             return _error(
