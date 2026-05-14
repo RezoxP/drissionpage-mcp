@@ -875,11 +875,16 @@ def _js_expression(expression: str) -> str:
 
 def _js_error_details(script: str, exc: Exception) -> dict[str, object]:
     message = str(exc)
-    kind = (
-        "syntax"
-        if re.search(r"syntax|unexpected token|parse|unterminated", message, re.I)
-        else "runtime"
-    )
+    kind = "runtime"
+    if re.search(r"syntax|unexpected token|parse|unterminated", message, re.I):
+        kind = "syntax"
+    elif "referenceerror" in message.lower():
+        kind = "reference"
+    elif "typeerror" in message.lower():
+        kind = "type"
+    elif "rangeerror" in message.lower():
+        kind = "range"
+
     line_number = None
     column_number = None
     with contextlib.suppress(Exception):
@@ -890,11 +895,17 @@ def _js_error_details(script: str, exc: Exception) -> dict[str, object]:
             if isinstance(exception, dict):
                 description = str(exception.get("description", exception.get("value", "")))
             message = description or str(details.get("text", message))
-            kind = (
-                "syntax"
-                if str(details.get("exceptionId", "")) == "1" or "syntax" in message.lower()
-                else "runtime"
-            )
+
+            kind = "runtime"
+            if str(details.get("exceptionId", "")) == "1" or "syntax" in message.lower():
+                kind = "syntax"
+            elif "referenceerror" in message.lower():
+                kind = "reference"
+            elif "typeerror" in message.lower():
+                kind = "type"
+            elif "rangeerror" in message.lower():
+                kind = "range"
+
             line_number = int(details.get("lineNumber", -1)) + 1
             column_number = int(details.get("columnNumber", -1)) + 1
     if line_number is None:
