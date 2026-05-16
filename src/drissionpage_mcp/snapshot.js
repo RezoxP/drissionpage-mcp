@@ -7,19 +7,24 @@ function cssPath(el) {
   if (el.id) return "#" + CSS.escape(el.id);
   const parts = [];
   while (el && el.nodeType === 1 && el !== el.ownerDocument.body) {
+    if (el.id) {
+      parts.unshift("#" + CSS.escape(el.id));
+      break;
+    }
     let part = el.nodeName.toLowerCase();
     if (el.classList && el.classList.length) {
       part += "." + Array.from(el.classList).slice(0, 3).map(CSS.escape).join(".");
     }
     const parent = el.parentElement;
-    if (parent) {
+    if (parent && !el.id) {
       const siblings = Array.from(parent.children).filter((child) => child.nodeName === el.nodeName);
       if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(el) + 1})`;
     }
     parts.unshift(part);
     el = parent;
+    if (parts.length >= 3) break;
   }
-  return parts.length ? "body > " + parts.join(" > ") : "body";
+  return parts.join(" > ");
 }
 
 function xpath(el) {
@@ -27,6 +32,10 @@ function xpath(el) {
   if (el.id) return `//*[@id=${JSON.stringify(el.id)}]`;
   const parts = [];
   while (el && el.nodeType === 1) {
+    if (el.id) {
+      parts.unshift(`*[@id=${JSON.stringify(el.id)}]`);
+      return "//" + parts.join("/");
+    }
     let index = 1;
     let sibling = el.previousElementSibling;
     while (sibling) {
